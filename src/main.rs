@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 const PORT: u16 = 45103;
 const DEAULT_THREADS: usize = 4;
 const MESSAGES_PER_CLIENT: usize = 100;
+const DEFAULT_ROUNDS: usize = 1;
+const TIMEOUT: i64 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Message {
@@ -18,10 +20,17 @@ struct Message {
 #[derive(Debug, Parser, Default)]
 #[clap(name = "reuseport")]
 pub struct Reuseport {
+    /// Run as server
     #[arg(short, default_value_t = false)]
     pub server: bool,
+
+    /// Number of threads (client or server) to create
     #[arg(short, default_value_t = DEAULT_THREADS)]
     pub threads: usize,
+
+    /// Only client: Number of rounds to recreate the clients to send messages
+    #[arg(short, default_value_t = DEFAULT_ROUNDS)]
+    pub rounds: usize,
 }
 
 fn main() {
@@ -33,7 +42,7 @@ fn main() {
         server(args.threads);
     } else {
         info!("Starting reuseport as client");
-        client(args.threads);
+        client(args.threads, args.rounds);
     }
 }
 
@@ -57,7 +66,7 @@ fn server(threads: usize) {
             let mut buf = [0u8; 1024];
             let mut fd_set = FdSet::new();
             fd_set.insert(&socket);
-            let mut timeout = TimeVal::new(10, 0);
+            let mut timeout = TimeVal::new(TIMEOUT, 0);
 
             // Wait for the first packet
             match select(socket.as_raw_fd() + 1, Some(&mut fd_set), None, None, Some(&mut timeout)) {
@@ -70,7 +79,7 @@ fn server(threads: usize) {
                 },
             }
 
-            let mut timeout = TimeVal::new(1, 0);
+            let mut timeout = TimeVal::new(TIMEOUT, 0);
 
             loop {
                 // Wait for data or timeout
@@ -112,31 +121,38 @@ fn server(threads: usize) {
     }
 }
 
-fn client(threads: usize) {
-    let mut handles: Vec<JoinHandle<()>> = Vec::new(); 
-    for i in 0..threads {
-        handles.push(std::thread::spawn(move || {
-            let socket = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None).expect("Creating socket failed!");
-            let addr = format!("127.0.0.1:{}", PORT);
-            let addr = SockaddrIn::from_str(&addr).expect("Failed to parse socketaddr");
-            connect(socket.as_raw_fd(), &addr).expect("Connecting to server failed");
+fn client(threads: usize, rounds: usize) {
+    let mut handles: Vec<JoinHandle<bool>> = Vec::new(); 
+    for i in 0..rounds {
+        info!("Round {}", i + 1);
+        for i in 0..threads {
+            handles.push(std::thread::spawn(move || {
+                let socket = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None).expect("Creating socket failed!");
+                let addr = format!("127.0.0.1:{}", PORT);
+                let addr = SockaddrIn::from_str(&addr).expect("Failed to parse socketaddr");
+                connect(socket.as_raw_fd(), &addr).expect("Connecting to server failed");
 
-            let sockaddr: SockaddrIn = getsockname(socket.as_raw_fd()).expect("Failed to get socket address");
-            let port = sockaddr.port();
+                let sockaddr: SockaddrIn = getsockname(socket.as_raw_fd()).expect("Failed to get socket address");
+                let port = sockaddr.port();
 
-            let msg = Message { thread: i, port };
+                let msg = Message { thread: i, port };
 
-            for _ in 0..MESSAGES_PER_CLIENT {
-                let msg_json = serde_json::to_string(&msg).unwrap();
-                if let Err(err) = send(socket.as_raw_fd(), msg_json.as_bytes(), MsgFlags::empty()) {
-                    error!("Failed to send message: {}", err);
-                    break;
+                for _ in 0..MESSAGES_PER_CLIENT {
+                    let msg_json = serde_json::to_string(&msg).unwrap();
+                    if let Err(_) = send(socket.as_raw_fd(), msg_json.as_bytes(), MsgFlags::empty()) {
+                        return false;
+                    }
+                    debug!("Sent message: {}", msg_json);
+                    thread::sleep(std::time::Duration::from_millis(10));
                 }
-                debug!("Sent message: {}", msg_json);
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }));
+                return true;
+            }));
+        }
+        let result = handles.into_iter().all(|handle| handle.join().unwrap());
+        if !result {
+            error!("Failed to send messages! Probably start the server first!");
+            return
+        }
+        handles = Vec::new();
     }
-
-    handles.into_iter().for_each(|handle| handle.join().unwrap());
 }
