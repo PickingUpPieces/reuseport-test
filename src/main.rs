@@ -1,12 +1,13 @@
 use std::{collections::HashMap, os::fd::AsRawFd, str::FromStr, thread::{self, JoinHandle}};
-use nix::sys::socket::{sockopt::ReusePort, *};
+use nix::{fcntl::{FcntlArg, OFlag}, libc::close, sys::socket::{sockopt::ReusePort, *}, sys::select::{select, FdSet}, sys::time::TimeVal};
+use nix::fcntl::fcntl;
 use clap::Parser;
-use log::info;
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 
 const PORT: u16 = 45103;
-const SERVER_THREADS: usize = 5;
-const CLIENT_THREADS: usize = 10;
+const DEAULT_THREADS: usize = 4;
+const MESSAGES_PER_CLIENT: usize = 100;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Message {
@@ -19,6 +20,8 @@ struct Message {
 pub struct Reuseport {
     #[arg(short, default_value_t = false)]
     pub server: bool,
+    #[arg(short, default_value_t = DEAULT_THREADS)]
+    pub threads: usize,
 }
 
 fn main() {
@@ -27,43 +30,91 @@ fn main() {
 
     if args.server {
         info!("Starting reuseport as server");
-        server();
+        server(args.threads);
     } else {
         info!("Starting reuseport as client");
-        client();
+        client(args.threads);
     }
 }
 
-fn server() {
-    let mut handles: Vec<JoinHandle<()>> = Vec::new(); 
-    for i in 0..SERVER_THREADS {
+fn server(threads: usize) {
+    let mut handles: Vec<JoinHandle<HashMap<u16, usize>>> = Vec::new(); 
+    let mut counter = 0;
+    for i in 0..threads {
+        let thread_id = counter;
+        counter += 1;
         handles.push(std::thread::spawn(move || {
             let socket = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None).expect("Creating socket failed!");
             let addr = format!("127.0.0.1:{}", PORT);
             let addr = SockaddrIn::from_str(&addr).expect("Failed to parse socketaddr");
-            
+
+            // Set the socket to non-blocking mode
+            fcntl(socket.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("Failed to set socket to non-blocking mode");
             setsockopt(&socket, ReusePort, &true).expect("Setting SO_REUSEPORT failed");
             bind(socket.as_raw_fd(), &addr).expect("Failed to bind listener");
 
             let mut map: HashMap<u16, usize>= HashMap::new();
-            // Receive in a loop
-            loop {
-                let mut buf = [0u8; 1024];
-                let len = recv(socket.as_raw_fd(), &mut buf, MsgFlags::empty()).expect("Failed to receive message");
-                let msg: Message = serde_json::from_str(std::str::from_utf8(&buf[..len]).unwrap()).unwrap();
+            let mut buf = [0u8; 1024];
+            let mut fd_set = FdSet::new();
+            fd_set.insert(&socket);
+            let mut timeout = TimeVal::new(10, 0);
 
-                map.entry(msg.port).and_modify(|count| *count += 1).or_insert(1);
-                info!("THREAD {}: {:?}", i, map);
+            // Wait for the first packet
+            match select(socket.as_raw_fd() + 1, Some(&mut fd_set), None, None, Some(&mut timeout)) {
+                Ok(n) if n > 0 => {
+                    info!("THREAD {}: Received first message: {:?}", i, map);
+                },
+                _ => {
+                    map.entry(thread_id).or_insert(0);
+                    return map
+                },
+            }
+
+            let mut timeout = TimeVal::new(1, 0);
+
+            loop {
+                // Wait for data or timeout
+                match select(socket.as_raw_fd() + 1, Some(&mut fd_set), None, None, Some(&mut timeout)) {
+                    Ok(n) if n > 0 => {
+                        match recv(socket.as_raw_fd(), &mut buf, MsgFlags::empty()) {
+                            Ok(_) => {},
+                            Err(err) => {
+                                error!("Failed to receive message: {}", err);
+                                return map;
+                            }
+                        };
+                        //let msg: Message = serde_json::from_str(std::str::from_utf8(&buf[..len]).unwrap()).unwrap();
+
+                        map.entry(thread_id).and_modify(|count| *count += 1).or_insert(1);
+                        debug!("THREAD {}: {:?}", i, map);
+                    },
+                    _ => {
+                        // Error occurred
+                        warn!("Error or no new messages after 1 second, finishing up...");
+                        unsafe { close(socket.as_raw_fd()); }
+                        return map;
+                    }
+                }
             }
         }));
     }
 
-    handles.into_iter().for_each(|handle| handle.join().unwrap());
+    let mut result_map: HashMap<u16, usize> = HashMap::new();
+    handles.into_iter().for_each(|handle| {
+        let map = handle.join().unwrap();
+        for (port, count) in map {
+            result_map.entry(port).and_modify(|c| *c += count).or_insert(count);
+        }
+    });
+    println!("Results:");
+    for (port, count) in result_map {
+        println!("Thread {}: Received {} messages", port, count);
+    }
 }
 
-fn client() {
+fn client(threads: usize) {
     let mut handles: Vec<JoinHandle<()>> = Vec::new(); 
-    for i in 0..CLIENT_THREADS {
+    for i in 0..threads {
         handles.push(std::thread::spawn(move || {
             let socket = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None).expect("Creating socket failed!");
             let addr = format!("127.0.0.1:{}", PORT);
@@ -75,10 +126,13 @@ fn client() {
 
             let msg = Message { thread: i, port };
 
-            for _ in 0..100 {
+            for _ in 0..MESSAGES_PER_CLIENT {
                 let msg_json = serde_json::to_string(&msg).unwrap();
-                send(socket.as_raw_fd(), msg_json.as_bytes(), MsgFlags::empty()).expect("Failed to send message");
-                info!("Sent message: {}", msg_json);
+                if let Err(err) = send(socket.as_raw_fd(), msg_json.as_bytes(), MsgFlags::empty()) {
+                    error!("Failed to send message: {}", err);
+                    break;
+                }
+                debug!("Sent message: {}", msg_json);
                 thread::sleep(std::time::Duration::from_millis(10));
             }
         }));
